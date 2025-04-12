@@ -1,0 +1,10 @@
+[package]
+name = "diana_srv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+regex = "1.11.1"
+serde = { version = "1.0.219", features = ["derive", "alloc", "std"] }
+tokio = { version = "1.44.2", features = ["full"] }
+toml = { version = "0.8.20", features = ["parse", "display", "preserve_order"] }

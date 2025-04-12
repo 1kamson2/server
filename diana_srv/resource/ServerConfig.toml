@@ -1,6 +1,6 @@
-[server]
 ip = "127.0.0.1"
 port = 8080
+full_addr = ""
 max_connected_hosts = 256
 cur_connected_hosts = 0
 timeout_in_secs = 32
