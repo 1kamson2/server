@@ -19,6 +19,30 @@ pub mod files {
         Path::new(file_path).exists()
     }
 
+    pub fn read_to_bytes(file_path: &Path) -> Vec<u8> {
+        /*
+         *  Read the entire file to the vector of bytes.
+         *
+         *  Arguments:
+         *      file_path: This should be preprocessed file path.
+         *
+         *  Returns:
+         *      Returns the vector of bytes, if it failed, it returns the empty vector.
+         */
+        let file_read_result = File::open(file_path);
+        let file_buffered_content = match file_read_result {
+            Ok(file) => file,
+            Err(_) => return Vec::new(),
+        };
+        let mut buf_reader = BufReader::new(file_buffered_content);
+        let mut content: Vec<u8> = Vec::new();
+        let content_buf_sz = buf_reader.read_to_end(&mut content);
+        match content_buf_sz {
+            Ok(n) => return if n > 0 { content } else { Vec::new() },
+            Err(_) => return Vec::new(),
+        };
+    }
+
     pub fn read_to_str(file_path: &Path) -> Result<String, io::Error> {
         /*
          *  Read the entire file to the string.
@@ -66,10 +90,19 @@ pub mod buffers {
         /* Ascii decimals */
         pub const NEWLINE: u8 = 10;
         pub const CR: u8 = 13;
-
+        pub const SPACE: u8 = 32;
         /* Content-Length: */
         pub const CONTENT_LENGTH_FIELD: &[u8] = &[
             67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32,
+        ];
+        /* Get */
+        pub const GET_REQUEST: &[u8] = &[71, 69, 84];
+        /* Post */
+        pub const POST_REQUEST: &[u8] = &[80, 79, 83, 84];
+        /* site_not_found.html */
+        pub const SITE_NOT_FOUND: &[u8] = &[
+            115, 105, 116, 101, 95, 110, 111, 116, 95, 102, 111, 117, 110, 100, 46, 104, 116, 109,
+            108,
         ];
     }
 
@@ -96,6 +129,7 @@ pub mod buffers {
             }
         }
     }
+
     pub fn extract_number(buffer: &[u8]) -> i64 {
         /*
          *  Extract the number in the buffer. It tries to extract until it
@@ -109,7 +143,6 @@ pub mod buffers {
          */
 
         // TODO: Should do better handling the verification.
-
         /* Initialize flags to handle sequences */
         let mut cr_flag: bool = false;
         let mut nl_flag: bool = false;
@@ -203,10 +236,7 @@ pub mod buffers {
 }
 
 mod tests {
-    use super::{
-        buffers::{constants::CONTENT_LENGTH_FIELD, find_in_buffer},
-        *,
-    };
+    use super::buffers::{constants::CONTENT_LENGTH_FIELD, find_in_buffer};
 
     #[test]
     fn find_in_buffer_test() {

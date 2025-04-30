@@ -1,7 +1,11 @@
-use crate::utils::readers::buffers::constants::CONTENT_LENGTH_FIELD;
+use crate::utils::readers::buffers::constants::{
+    CONTENT_LENGTH_FIELD, GET_REQUEST, POST_REQUEST, SITE_NOT_FOUND, SPACE,
+};
 use crate::utils::readers::buffers::{extract_number, find_in_buffer, read_tcpstream};
-use crate::utils::readers::files::read_toml;
+use crate::utils::readers::files::{check_if_file_exists, read_to_bytes, read_toml};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{io, path::Path};
@@ -16,6 +20,14 @@ enum HttpResponseStatus {
     Forbidden = 403,
     NotFound = 404,
     IamATeapot = 418,
+}
+
+#[derive(PartialEq, Debug)]
+enum RequestType {
+    /* Those specify how many positions to skip, not including whitespaces. */
+    Get = 0,
+    Post = 1,
+    Invalid = -1,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,10 +51,20 @@ pub struct Server {
      */
     ip: String,
     port: u16,
+
+    #[serde(skip)]
     full_addr: String,
     max_connected_hosts: u32,
+
+    #[serde(skip)]
     cur_connected_hosts: u32,
     timeout_in_secs: u32,
+
+    #[serde(skip)]
+    cached_sites: HashMap<Vec<u8>, Vec<u8>>,
+
+    #[serde(skip)]
+    resource_html_dir: Vec<u8>,
 }
 
 impl Server {
@@ -60,8 +82,12 @@ impl Server {
          *      the server instance or fail due to the incorrect configuration.
          */
         let mut cfg: Server = read_toml(toml_config)?;
-
         cfg.full_addr = format!("{0}:{1}", cfg.ip, cfg.port);
+        cfg.cur_connected_hosts = 0;
+        cfg.cached_sites = HashMap::new();
+        cfg.resource_html_dir = vec![
+            114, 101, 115, 111, 117, 114, 99, 101, 47, 104, 116, 109, 108, 47,
+        ];
         return Ok(cfg);
     }
 
@@ -79,6 +105,95 @@ impl Server {
             let thread = Arc::clone(self);
             tokio::spawn(async move { thread.conn_handler(inc_stream, inc_addr).await });
         }
+    }
+
+    pub fn read_request_type(&self, buffer: &Vec<u8>) -> RequestType {
+        /*
+         *  Get the type of the request.
+         *
+         *  Parameters:
+         *      buffer: Bytes of the stream, that was read into the vector.
+         *
+         *  Returns:
+         *      It returns either GET or POST enum.
+         */
+
+        if buffer[0..3] == *GET_REQUEST {
+            return RequestType::Get;
+        }
+
+        if buffer[0..4] == *POST_REQUEST {
+            return RequestType::Post;
+        }
+        RequestType::Invalid
+    }
+
+    pub fn read_resource(&self, buffer: &Vec<u8>, req_type: &RequestType) -> Vec<u8> {
+        /*
+         *  Read what resource user requests.
+         *
+         *  Parameters:
+         *      buffer: Bytes of the stream, that was read into the vector.
+         *      req_type: Get the request type.
+         *
+         *  Returns:
+         *      Resource in bytes.
+         */
+
+        /* Extract the number */
+        // TODO: Write accessor to the values
+        let request_offset: usize = match req_type {
+            RequestType::Get => 3,
+            RequestType::Post => 4,
+            RequestType::Invalid => usize::MAX,
+        };
+        let mut vec_to_return: Vec<u8> = Vec::new();
+        for byte in buffer[request_offset + 1..].iter() {
+            if *byte == SPACE {
+                return vec_to_return;
+            }
+            vec_to_return.push(*byte);
+        }
+        Vec::new()
+    }
+
+    pub fn fetch_resource(&mut self, resource_path: &Vec<u8>) -> &Vec<u8> {
+        /*
+         *  Fetch the data requested by user.
+         *
+         *  Parameters:
+         *      resource_path: Resource path from the request.
+         *
+         *  Returns:
+         *      The contents of the resource.
+         */
+
+        // TODO: Check all files beforehand
+        // TODO: Add bad site handling, for now it returns nothing.
+        let path: String = String::from(std::str::from_utf8(resource_path).unwrap());
+        if resource_path.is_empty() {
+            // TODO: Change it to the welcome site later
+            return &self.cached_sites[SITE_NOT_FOUND];
+        }
+        if !check_if_file_exists(&path) {
+            return &self.cached_sites[SITE_NOT_FOUND];
+        }
+
+        if !self.cached_sites.contains_key(resource_path) {
+            let site: Vec<u8> = read_to_bytes(Path::new(&path));
+
+            /* Failed to read */
+            if site.is_empty() {
+                return &self.cached_sites[SITE_NOT_FOUND];
+            }
+            /*
+             * We can allow for to_vec, because loading will occurr
+             * limited number of times
+             */
+            self.cached_sites.insert(resource_path.to_vec(), site);
+        }
+
+        &self.cached_sites[resource_path]
     }
 
     pub fn read_request_body(&self, buffer: &Vec<u8>) -> Vec<u8> {
@@ -110,10 +225,10 @@ impl Server {
 
         let buffer_sz: usize = buffer.len();
         // TODO: Very vulnerable, we assume that the content is valid.
-        buffer[(body_length as usize - buffer_sz)..].to_vec()
+        buffer[(buffer_sz - body_length as usize)..].to_vec()
     }
 
-    async fn conn_handler(&self, mut inc_stream: TcpStream, inc_addr: SocketAddr) {
+    async fn conn_handler(&mut self, mut inc_stream: TcpStream, inc_addr: SocketAddr) {
         /*
          *  Handles each incoming connection. It will read the incoming requests,
          *  create appropiate responses and send them out.
@@ -135,10 +250,26 @@ impl Server {
             }
         };
 
-        let read_result = self.read_request_body(&vec_buf);
-        if read_result.is_empty() {
+        /* Try to read the body */
+        let read_body_result: Vec<u8> = self.read_request_body(&vec_buf);
+        if read_body_result.is_empty() {
             println!("[WARNING] Failed to read the body. Assume the handshake.");
-            // do something here
+            self.fetch_resource(&read_body_result);
+            return;
+        }
+
+        /* Fetch the rest now, since body should be valid */
+        /* Try to read the request type */
+        let request_type: RequestType = self.read_request_type(&vec_buf);
+        if request_type == RequestType::Invalid {
+            println!("[ERROR] Invalid request type.");
+            return;
+        }
+
+        /* Try to read the resource path */
+        let resource_path: Vec<u8> = self.read_resource(&vec_buf, &request_type);
+        if resource_path.is_empty() {
+            println!("[ERROR] Failed to read the resource.");
             return;
         }
 
@@ -159,23 +290,45 @@ mod tests {
     use crate::utils;
 
     use super::*;
-    fn server_init() -> Server {
-        let args: Vec<String> = env::args().collect();
-        let cfg_path: &String = &args[1];
-        let cfg: &Path = utils::configs::server::config_toml(cfg_path);
-        Server::new(cfg).unwrap()
-    }
-
-    fn read_request_body_test() {
-        const TEST_REQUEST: &[u8] = b"POST /api/data HTTP/1.1\r\n\
+    const TEST_POST_REQUEST: &[u8] = b"POST /api/data HTTP/1.1\r\n\
             Host: example.com\r\n\
             Content-Type: application/json\r\n\
             Content-Length: 27\r\n\
             \r\n\
             {\"key\":\"value\",\"number\":42}";
+    const TEST_POST_RESOURCE: &[u8] = b"/api/data";
+
+    fn server_init() -> Server {
+        let cfg_name: String = String::from("resource/ServerConfig.toml");
+        let cfg: &Path = utils::configs::server::config_toml(&cfg_name);
+        Server::new(cfg).unwrap()
+    }
+
+    #[test]
+    fn read_request_body_test() {
         let srv = server_init();
-        let res = srv.read_request_body(&Vec::from(TEST_REQUEST));
+        let res = srv.read_request_body(&Vec::from(TEST_POST_REQUEST));
         let request_body: Vec<u8> = Vec::from(b"{\"key\":\"value\",\"number\":42}");
         assert_eq!(res, request_body);
+    }
+
+    #[test]
+    fn read_request_type_test() {
+        let srv = server_init();
+        let test_req_as_buffer: Vec<u8> = Vec::from(TEST_POST_REQUEST);
+        assert_eq!(
+            srv.read_request_type(&test_req_as_buffer),
+            RequestType::Post
+        );
+    }
+
+    #[test]
+    fn read_resource_test() {
+        let srv = server_init();
+        let test_req_as_buffer: Vec<u8> = Vec::from(TEST_POST_REQUEST);
+        assert_eq!(
+            srv.read_resource(&test_req_as_buffer, &RequestType::Post),
+            Vec::from(TEST_POST_RESOURCE)
+        );
     }
 }
