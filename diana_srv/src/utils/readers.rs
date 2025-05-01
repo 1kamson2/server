@@ -3,7 +3,7 @@ pub mod files {
     use std::fs::File;
     use std::io;
     use std::io::{BufReader, prelude::*};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use toml;
 
     pub fn check_if_file_exists(file_path: &String) -> bool {
@@ -17,6 +17,19 @@ pub mod files {
          *      Return true if exists, false otherwise.
          */
         Path::new(file_path).exists()
+    }
+
+    pub fn bytes_to_path(vec_buf: &Vec<u8>) -> PathBuf {
+        /*
+         *  Convert the bytes to the PathBuf.
+         *
+         *  Arguments:
+         *      vec_buf: Vector of bytes.
+         *
+         *  Returns:
+         *      PathBuf
+         */
+        PathBuf::from(String::from_utf8(vec_buf.to_vec()).unwrap())
     }
 
     pub fn read_to_bytes(file_path: &Path) -> Vec<u8> {
@@ -104,6 +117,12 @@ pub mod buffers {
             115, 105, 116, 101, 95, 110, 111, 116, 95, 102, 111, 117, 110, 100, 46, 104, 116, 109,
             108,
         ];
+        /* resource/html/ */
+        pub const RESOURCE_HTML_DIR: &[u8] = &[
+            114, 101, 115, 111, 117, 114, 99, 101, 47, 104, 116, 109, 108, 47,
+        ];
+        /* .html */
+        pub const DOT_HTML: &[u8] = &[46, 104, 116, 109, 108];
     }
 
     pub fn read_tcpstream(stream: &TcpStream) -> Result<Vec<u8>, Box<dyn Error>> {

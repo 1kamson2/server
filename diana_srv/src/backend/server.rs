@@ -1,18 +1,20 @@
 use crate::utils::readers::buffers::constants::{
-    CONTENT_LENGTH_FIELD, GET_REQUEST, POST_REQUEST, SITE_NOT_FOUND, SPACE,
+    CONTENT_LENGTH_FIELD, DOT_HTML, GET_REQUEST, POST_REQUEST, RESOURCE_HTML_DIR, SITE_NOT_FOUND,
+    SPACE,
 };
 use crate::utils::readers::buffers::{extract_number, find_in_buffer, read_tcpstream};
-use crate::utils::readers::files::{check_if_file_exists, read_to_bytes, read_toml};
+use crate::utils::readers::files::{bytes_to_path, check_if_file_exists, read_to_bytes, read_toml};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::{io, path::Path};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-enum HttpResponseStatus {
+pub enum HttpResponseStatus {
+    /*
+     * Defines all status codes
+     */
     Ok = 200,
     NoContent = 204,
     NotModified = 304,
@@ -22,12 +24,50 @@ enum HttpResponseStatus {
     IamATeapot = 418,
 }
 
+impl HttpResponseStatus {
+    pub fn value(&self) -> usize {
+        /*
+         *  Accessor.
+         *
+         *  Returns:
+         *      Status code, that this enum owns.
+         */
+        match self {
+            Self::Ok => 200,
+            Self::NoContent => 204,
+            Self::NotModified => 304,
+            Self::BadRequest => 400,
+            Self::Forbidden => 403,
+            Self::NotFound => 404,
+            Self::IamATeapot => 418,
+        }
+    }
+}
+
 #[derive(PartialEq, Debug)]
-enum RequestType {
-    /* Those specify how many positions to skip, not including whitespaces. */
+pub enum RequestType {
+    /*
+     * Specify HTTP methods
+     */
     Get = 0,
     Post = 1,
     Invalid = -1,
+}
+
+impl RequestType {
+    pub fn value(&self) -> usize {
+        /*
+         *  Accessor. Returns offsets to parse the HTML request.
+         *
+         *  Returns:
+         *      HTTP request method, that this enum owns.
+         */
+        match self {
+            Self::Get => 3,
+            Self::Post => 4,
+            Self::Invalid => usize::MAX,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -100,18 +140,19 @@ impl Server {
         let mut ss: ThreadSharedState = ThreadSharedState {
             cur_connected_hosts: 0,
             cached_sites: HashMap::new(),
-            resource_html_dir: vec![
-                114, 101, 115, 111, 117, 114, 99, 101, 47, 104, 116, 109, 108, 47,
-            ],
+            resource_html_dir: Vec::from(RESOURCE_HTML_DIR),
         };
 
-        /* TODO: TEMP */
+        let mut site_not_found_path_buf: Vec<u8> = ss.resource_html_dir.clone();
+        site_not_found_path_buf.extend(Vec::from(SITE_NOT_FOUND));
+        let site_not_found_path = bytes_to_path(&site_not_found_path_buf);
+        let site_not_found_content: Vec<u8> = read_to_bytes(site_not_found_path.as_path());
         ss.cached_sites
-            .insert(SITE_NOT_FOUND.to_vec(), "Hello World".as_bytes().to_vec());
+            .insert(SITE_NOT_FOUND.to_vec(), site_not_found_content);
 
         cfg.shared_state = ss;
 
-        return Ok(cfg);
+        Ok(cfg)
     }
 
     #[tokio::main]
@@ -164,13 +205,11 @@ impl Server {
          *      Resource in bytes.
          */
 
-        /* Extract the number */
-        // TODO: Write accessor to the values
-        let request_offset: usize = match req_type {
-            RequestType::Get => 3,
-            RequestType::Post => 4,
-            RequestType::Invalid => usize::MAX,
-        };
+        /* Extract the offset value */
+        let request_offset: usize = req_type.value();
+        if request_offset == usize::MAX {
+            return Vec::new();
+        }
         let mut vec_to_return: Vec<u8> = Vec::new();
         for byte in buffer[request_offset + 1..].iter() {
             if *byte == SPACE {
@@ -279,17 +318,6 @@ impl Server {
             }
         };
 
-        /* Try to read the body */
-        let read_body_result: Vec<u8> = self.read_request_body(&vec_buf);
-        if read_body_result.is_empty() {
-            println!("[WARNING] Failed to read the body. Assume the handshake.");
-            let site_content = self.fetch_resource(&read_body_result);
-            let response: Vec<u8> = format_message(site_content);
-            inc_stream.write_all(&response).await.unwrap();
-            return;
-        }
-
-        /* Fetch the rest now, since body should be valid */
         /* Try to read the request type */
         let request_type: RequestType = self.read_request_type(&vec_buf);
         if request_type == RequestType::Invalid {
@@ -304,6 +332,16 @@ impl Server {
             return;
         }
 
+        /* Try to read the body */
+        let read_body_result: Vec<u8> = self.read_request_body(&vec_buf);
+        if read_body_result.is_empty() && request_type == RequestType::Post {
+            println!("[WARNING] Failed to read the body. Assume the handshake.");
+            let site_content = self.fetch_resource(&read_body_result);
+            let response: Vec<u8> = format_message(site_content);
+            inc_stream.write_all(&response).await.unwrap();
+            return;
+        }
+
         let site_content: &Vec<u8> = self.fetch_resource(&resource_path);
         let response: Vec<u8> = format_message(site_content);
         inc_stream.write_all(&response).await.unwrap();
@@ -311,8 +349,17 @@ impl Server {
 }
 
 pub fn format_message(site_content: &Vec<u8>) -> Vec<u8> {
-    let sz = site_content.len();
-    let status = 200;
+    /*
+     *  Format the HTTP response.
+     *
+     *  Arguments:
+     *      site_content: The buffer vector of site in the user's request.
+     *
+     *  Returns:
+     *      Response in bytes.
+     * */
+    let sz: usize = site_content.len();
+    let status: usize = RequestType::Get.value();
     let mut response: Vec<u8> = format!(
         "HTTP/1.1 {status} OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {sz}\r\n\r\n"
     )
