@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{io, path::Path};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -30,41 +30,54 @@ enum RequestType {
     Invalid = -1,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ThreadSharedState {
+    /*
+     *  Structure for safe thread sharing.
+     *
+     *  Attributes:
+     *      cur_connected_hosts: The tracker of the number of concurrent hosts.
+     *      This will be used for logic of disconnecting the users.
+     *      cached_sites: Keeps recently visited sites for better and faster
+     *      search results.
+     *      resource_html_dir: Holds name of the resource directory in bytes.
+     */
+    #[serde(skip)]
+    pub cur_connected_hosts: u32,
+    #[serde(skip)]
+    pub cached_sites: HashMap<Vec<u8>, Vec<u8>>,
+    #[serde(skip)]
+    pub resource_html_dir: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct Server {
     /*
-     *  Main structure for Server implementation.
+     *  The implementation of server instance, responsible for:
+     *      - handling incoming connections,
+     *      - validating, sanitizing user requests,
+     *      - responding to the requests,
+     *      - fetching correct sites.
      *
      *  Attributes:
      *      ip: Keeps host's ip, that is used to connect to this server.
      *      port: Keeps host's port, that will be used to connect to this server.
-     *      full_addr: Combines both ip and port, to make full address,
-     *      that will allow user to connect and use the server.
      *      max_connected_hosts: The maximum number of hosts (users) that
      *      can be connected at one time.h If the current number of hosts
      *      connected exceeds this number, the server will refuse further
      *      attempts of connections.
-     *      cur_connected_hosts: The tracker of the number of concurrent hosts.
-     *      This will be used for logic of disconnecting the users.
      *      timeout_in_secs: The maximum time for host connection if it
      *      doesn't respond
+     *      shared_state: Structure that is needed for safe thread sharing.
+     *
      */
     ip: String,
     port: u16,
-
-    #[serde(skip)]
-    full_addr: String,
     max_connected_hosts: u32,
-
-    #[serde(skip)]
-    cur_connected_hosts: u32,
     timeout_in_secs: u32,
 
     #[serde(skip)]
-    cached_sites: HashMap<Vec<u8>, Vec<u8>>,
-
-    #[serde(skip)]
-    resource_html_dir: Vec<u8>,
+    shared_state: ThreadSharedState,
 }
 
 impl Server {
@@ -75,38 +88,49 @@ impl Server {
          *
          *  Arguments:
          *      toml_config: Path for the server's config, it must contain all
-         *      attributes listed in the structure definition.
+         *      attributes listed in the structure definition, except
+         *      those marked with #[serde(skip)].
          *
          *  Returns:
          *      It returns Result<...> since the function might return
          *      the server instance or fail due to the incorrect configuration.
          */
+
         let mut cfg: Server = read_toml(toml_config)?;
-        cfg.full_addr = format!("{0}:{1}", cfg.ip, cfg.port);
-        cfg.cur_connected_hosts = 0;
-        cfg.cached_sites = HashMap::new();
-        cfg.resource_html_dir = vec![
-            114, 101, 115, 111, 117, 114, 99, 101, 47, 104, 116, 109, 108, 47,
-        ];
+        let mut ss: ThreadSharedState = ThreadSharedState {
+            cur_connected_hosts: 0,
+            cached_sites: HashMap::new(),
+            resource_html_dir: vec![
+                114, 101, 115, 111, 117, 114, 99, 101, 47, 104, 116, 109, 108, 47,
+            ],
+        };
+
+        /* TODO: TEMP */
+        ss.cached_sites
+            .insert(SITE_NOT_FOUND.to_vec(), "Hello World".as_bytes().to_vec());
+
+        cfg.shared_state = ss;
+
         return Ok(cfg);
     }
 
     #[tokio::main]
-    pub async fn run(self: &Arc<Self>) {
+    pub async fn run(&mut self) {
         /*
-         *  The main function, that creates TCPListener based on the full address,
-         *  accepts incoming connections and moves it onto light threads.
-         *  The incoming streams and addresses are moved to the function,
-         *  that handles the connections.
+         * The main function, that creates TCPListener based on the full address,
+         * accepts incoming connections and moves it onto light threads.
+         * The incoming streams and addresses are moved to the function,
+         * that handles the connections.
          */
-        let listener = TcpListener::bind(&self.full_addr).await.unwrap();
+
+        /* Construct full address */
+        let full_addr: String = format!("{}:{}", self.ip, self.port);
+        let listener = TcpListener::bind(&full_addr).await.unwrap();
         loop {
             let (inc_stream, inc_addr) = listener.accept().await.unwrap();
-            let thread = Arc::clone(self);
-            tokio::spawn(async move { thread.conn_handler(inc_stream, inc_addr).await });
+            self.conn_handler(inc_stream, inc_addr).await;
         }
     }
-
     pub fn read_request_type(&self, buffer: &Vec<u8>) -> RequestType {
         /*
          *  Get the type of the request.
@@ -170,30 +194,35 @@ impl Server {
 
         // TODO: Check all files beforehand
         // TODO: Add bad site handling, for now it returns nothing.
-        let path: String = String::from(std::str::from_utf8(resource_path).unwrap());
         if resource_path.is_empty() {
             // TODO: Change it to the welcome site later
-            return &self.cached_sites[SITE_NOT_FOUND];
-        }
-        if !check_if_file_exists(&path) {
-            return &self.cached_sites[SITE_NOT_FOUND];
+            return &self.shared_state.cached_sites[SITE_NOT_FOUND];
         }
 
-        if !self.cached_sites.contains_key(resource_path) {
+        if !self.shared_state.cached_sites.contains_key(resource_path) {
+            let mut path_on_server: Vec<u8> = self.shared_state.resource_html_dir.clone();
+            path_on_server.extend_from_slice(resource_path);
+
+            let path: String = String::from(std::str::from_utf8(&path_on_server).unwrap());
+            if !check_if_file_exists(&path) {
+                return &self.shared_state.cached_sites[SITE_NOT_FOUND];
+            }
+
             let site: Vec<u8> = read_to_bytes(Path::new(&path));
 
             /* Failed to read */
             if site.is_empty() {
-                return &self.cached_sites[SITE_NOT_FOUND];
+                return &self.shared_state.cached_sites[SITE_NOT_FOUND];
             }
             /*
              * We can allow for to_vec, because loading will occurr
              * limited number of times
              */
-            self.cached_sites.insert(resource_path.to_vec(), site);
+            self.shared_state
+                .cached_sites
+                .insert(resource_path.to_vec(), site);
         }
-
-        &self.cached_sites[resource_path]
+        &self.shared_state.cached_sites[resource_path]
     }
 
     pub fn read_request_body(&self, buffer: &Vec<u8>) -> Vec<u8> {
@@ -254,7 +283,9 @@ impl Server {
         let read_body_result: Vec<u8> = self.read_request_body(&vec_buf);
         if read_body_result.is_empty() {
             println!("[WARNING] Failed to read the body. Assume the handshake.");
-            self.fetch_resource(&read_body_result);
+            let site_content = self.fetch_resource(&read_body_result);
+            let response: Vec<u8> = format_message(site_content);
+            inc_stream.write_all(&response).await.unwrap();
             return;
         }
 
@@ -273,14 +304,22 @@ impl Server {
             return;
         }
 
-        let content = "Hello World!";
-        let sz = content.len();
-        let status = 404;
-        let response = format!(
-            "HTTP/1.1 {status} BAD\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {sz}\r\n\r\n{content}"
-        );
-        inc_stream.write_all(response.as_bytes()).await.unwrap();
+        let site_content: &Vec<u8> = self.fetch_resource(&resource_path);
+        let response: Vec<u8> = format_message(site_content);
+        inc_stream.write_all(&response).await.unwrap();
     }
+}
+
+pub fn format_message(site_content: &Vec<u8>) -> Vec<u8> {
+    let sz = site_content.len();
+    let status = 200;
+    let mut response: Vec<u8> = format!(
+        "HTTP/1.1 {status} OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {sz}\r\n\r\n"
+    )
+    .as_bytes()
+    .to_vec();
+    response.extend(site_content);
+    return response;
 }
 
 mod tests {

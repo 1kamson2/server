@@ -8,10 +8,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let cfg_path: &String = &args[1];
     let cfg: &Path = config_toml(cfg_path);
-    let srv = Arc::new(match Server::new(cfg) {
-        Ok(srv_instance) => srv_instance,
-        Err(_) => panic!("[ERROR] Server couldn't be created"),
-    });
+    let mut srv = Server::new(cfg).unwrap();
     srv.run();
 }
 /*
